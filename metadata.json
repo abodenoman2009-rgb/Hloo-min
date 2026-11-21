@@ -1,0 +1,6 @@
+{
+  "name": "Connect - كونكت",
+  "description": "منصة تواصل فوري ومكالمات صوتية ومرئية حقيقية بالعربية والإنجليزية | Real-time messaging, WebRTC voice & video calls, friendships, and admin moderation.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,945 @@
+م
+تفكيرأفكار
+قم بالتوسع لعرض الأفكار النموذجية
+
+كل صراحة وضحح: لا يوجد هنا "قسم لإنشاء التطبيقات" يمكنني التحويل إليه، ولا أملك بيئة تشغيل أو محاكي لبناء ملفات APK/IPA أو رفع التطبيق ونشره مباشرة.
+
+ما يمكنني القيام به هو كتابة كود المشروع الحقيقي الكامل هنا مقسما بشكل منظم حتى تنسخه وتشغله على جهازك (عبر VS Code / Cursor و Expo و Supabase).
+
+بما أن رسالة قاعدة البيانات السابقة انقطعت عند جدولاتصل بالمشاركين، سأبدأ الآن بإكمال قاعدة البيانات وسياسات الأمان بالكامل، ثم أضع لك إعداد مشروع التطبيق (التطبيقات/الجوال)،نظام المصادقة الحقيقي (البريد الإلكتروني + جوجل + أبل)، محرك المكالمات الحقيقي WebRTC + الإشارة + STUN/TURN، والوظائف السحابية (وظائف الحافة).
+
+أولا: استكمال قاعدة البيانات وسياسات الأمان (PostgreSQL / Supabase)
+أضف هذا الجزء بعد جدولمكالماتمباشرة في Supabase SQL Editor (supabase/migrations/002_complete_schema_and_rls.sql):
+
+إس إل
+-- 6. المشاركون في المكالمات (للمكالمات الفردية والجماعية)
+CREATE TABLE public.call_participants (
+  call_id UUID NOT NULL REFERENCES public.calls(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'invited' CHECK (status IN ('invited', 'joined', 'left', 'declined', 'missed')),
+  joined_at TIMESTAMPTZ,
+  left_at TIMESTAMPTZ,
+  PRIMARY KEY (call_id, user_id)
+);
+
+-- 7. جدول البلاغات (للوحة تحكم المشرف)
+CREATE TABLE public.reports (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  reporter_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  reported_user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  reason TEXT NOT NULL,
+  details TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'reviewed', 'resolved', 'dismissed')),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 8. جدول إعدادات التطبيق العامة (يتحكم بها المشرف)
+CREATE TABLE public.app_settings (
+  key TEXT PRIMARY KEY,
+  value JSONB NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO public.app_settings (key, value) VALUES
+  ('maintenance_mode', '{"enabled": false, "message_ar": "", "message_en": ""}'),
+  ('calls_enabled', '{"audio": true, "video": true, "max_group_participants": 8}')
+ON CONFLICT (key) DO NOTHING;
+
+-- الفهارس لتحسين الأداء
+CREATE INDEX idx_friendships_users ON public.friendships(requester_id, addressee_id);
+CREATE INDEX idx_messages_conversation_created ON public.messages(conversation_id, created_at DESC);
+CREATE INDEX idx_calls_caller_started ON public.calls(caller_id, started_at DESC);
+CREATE INDEX idx_profiles_username ON public.profiles(username);
+
+-- دوال مساعدة SECURITY DEFINER لتجنب Recursion في سياسات RLS
+CREATE OR REPLACE FUNCTION public.is_conversation_member(conv_id UUID, uid UUID)
+RETURNS BOOLEAN
+LANGUAGE SQL
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.conversation_participants
+    WHERE conversation_id = conv_id AND user_id = uid
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_call_participant(c_id UUID, uid UUID)
+RETURNS BOOLEAN
+LANGUAGE SQL
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.calls WHERE id = c_id AND caller_id = uid
+  ) OR EXISTS (
+    SELECT 1 FROM public.call_participants WHERE call_id = c_id AND user_id = uid
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_admin(uid UUID)
+RETURNS BOOLEAN
+LANGUAGE SQL
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.profiles WHERE id = uid AND role = 'admin'
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_blocked_between(u1 UUID, u2 UUID)
+RETURNS BOOLEAN
+LANGUAGE SQL
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.friendships
+    WHERE status = 'blocked'
+      AND ((requester_id = u1 AND addressee_id = u2) OR (requester_id = u2 AND addressee_id = u1))
+  );
+$$;
+
+-- Trigger لإنشاء ملف شخصي تلقائياً عند التسجيل بالبريد أو Google أو Apple
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  base_username TEXT;
+  final_username TEXT;
+BEGIN
+  base_username := regexp_replace(
+    lower(coalesce(NEW.raw_user_meta_data->>'username', split_part(NEW.email, '@', 1), 'user')),
+    '[^a-z0-9_]', '_', 'g'
+  );
+  IF char_length(base_username) < 3 THEN
+    base_username := 'user_' || base_username;
+  END IF;
+  final_username := left(base_username, 18) || '_' || substr(replace(NEW.id::text, '-', ''), 1, 5);
+
+  INSERT INTO public.profiles (id, username, full_name, avatar_url)
+  VALUES (
+    NEW.id,
+    final_username,
+    coalesce(NEW.raw_user_meta_data->>'full_name', NEW.raw_user_meta_data->>'name', 'مستخدم جديد'),
+    NEW.raw_user_meta_data->>'avatar_url'
+  )
+  ON CONFLICT (id) DO NOTHING;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- Trigger لتحديث last_message_at عند إرسال رسالة جديدة
+CREATE OR REPLACE FUNCTION public.update_conversation_timestamp()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  UPDATE public.conversations SET last_message_at = NEW.created_at WHERE id = NEW.conversation_id;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_message_created
+  AFTER INSERT ON public.messages
+  FOR EACH ROW EXECUTE FUNCTION public.update_conversation_timestamp();
+
+-- تفعيل Row Level Security (RLS) على جميع الجداول
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.friendships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.conversations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.conversation_participants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.message_reads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.calls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.call_participants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.app_settings ENABLE ROW LEVEL SECURITY;
+
+-- سياسات profiles
+CREATE POLICY "profiles_select_authenticated" ON public.profiles
+  FOR SELECT TO authenticated USING (NOT is_banned OR id = auth.uid() OR is_admin(auth.uid()));
+
+CREATE POLICY "profiles_update_own_or_admin" ON public.profiles
+  FOR UPDATE TO authenticated
+  USING (id = auth.uid() OR is_admin(auth.uid()))
+  WITH CHECK (
+    (id = auth.uid() AND role = (SELECT role FROM public.profiles WHERE id = auth.uid()))
+    OR is_admin(auth.uid())
+  );
+
+-- سياسات friendships
+CREATE POLICY "friendships_select_own" ON public.friendships
+  FOR SELECT TO authenticated USING (requester_id = auth.uid() OR addressee_id = auth.uid());
+
+CREATE POLICY "friendships_insert_own" ON public.friendships
+  FOR INSERT TO authenticated WITH CHECK (requester_id = auth.uid());
+
+CREATE POLICY "friendships_update_participants" ON public.friendships
+  FOR UPDATE TO authenticated USING (requester_id = auth.uid() OR addressee_id = auth.uid());
+
+CREATE POLICY "friendships_delete_participants" ON public.friendships
+  FOR DELETE TO authenticated USING (requester_id = auth.uid() OR addressee_id = auth.uid());
+
+-- سياسات conversations & participants
+CREATE POLICY "conversations_select_member" ON public.conversations
+  FOR SELECT TO authenticated USING (is_conversation_member(id, auth.uid()));
+
+CREATE POLICY "conversations_insert_auth" ON public.conversations
+  FOR INSERT TO authenticated WITH CHECK (created_by = auth.uid());
+
+CREATE POLICY "participants_select_member" ON public.conversation_participants
+  FOR SELECT TO authenticated USING (is_conversation_member(conversation_id, auth.uid()));
+
+CREATE POLICY "participants_insert_creator_or_self" ON public.conversation_participants
+  FOR INSERT TO authenticated WITH CHECK (
+    user_id = auth.uid() OR EXISTS (
+      SELECT 1 FROM public.conversations WHERE id = conversation_id AND created_by = auth.uid()
+    )
+  );
+
+-- سياسات messages (تمنع الوصول لغير أعضاء المحادثة)
+CREATE POLICY "messages_select_member" ON public.messages
+  FOR SELECT TO authenticated USING (is_conversation_member(conversation_id, auth.uid()));
+
+CREATE POLICY "messages_insert_member" ON public.messages
+  FOR INSERT TO authenticated WITH CHECK (
+    sender_id = auth.uid() AND is_conversation_member(conversation_id, auth.uid())
+  );
+
+CREATE POLICY "messages_update_sender" ON public.messages
+  FOR UPDATE TO authenticated USING (sender_id = auth.uid());
+
+CREATE POLICY "message_reads_all_member" ON public.message_reads
+  FOR ALL TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.messages m
+      WHERE m.id = message_id AND is_conversation_member(m.conversation_id, auth.uid())
+    )
+  )
+  WITH CHECK (user_id = auth.uid());
+
+-- سياسات calls & call_participants
+CREATE POLICY "calls_select_participant" ON public.calls
+  FOR SELECT TO authenticated USING (is_call_participant(id, auth.uid()));
+
+CREATE POLICY "calls_insert_caller" ON public.calls
+  FOR INSERT TO authenticated WITH CHECK (caller_id = auth.uid());
+
+CREATE POLICY "calls_update_participant" ON public.calls
+  FOR UPDATE TO authenticated USING (is_call_participant(id, auth.uid()));
+
+CREATE POLICY "call_participants_select" ON public.call_participants
+  FOR SELECT TO authenticated USING (is_call_participant(call_id, auth.uid()));
+
+CREATE POLICY "call_participants_insert" ON public.call_participants
+  FOR INSERT TO authenticated WITH CHECK (
+    EXISTS (SELECT 1 FROM public.calls WHERE id = call_id AND caller_id = auth.uid())
+  );
+
+CREATE POLICY "call_participants_update" ON public.call_participants
+  FOR UPDATE TO authenticated USING (user_id = auth.uid() OR is_call_participant(call_id, auth.uid()));
+
+-- سياسات reports & app_settings
+CREATE POLICY "reports_insert_own" ON public.reports
+  FOR INSERT TO authenticated WITH CHECK (reporter_id = auth.uid());
+
+CREATE POLICY "reports_select_own_or_admin" ON public.reports
+  FOR SELECT TO authenticated USING (reporter_id = auth.uid() OR is_admin(auth.uid()));
+
+CREATE POLICY "reports_update_admin" ON public.reports
+  FOR UPDATE TO authenticated USING (is_admin(auth.uid()));
+
+CREATE POLICY "settings_select_all" ON public.app_settings
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY "settings_update_admin" ON public.app_settings
+  FOR UPDATE TO authenticated USING (is_admin(auth.uid()));
+
+-- تفعيل Realtime للجداول المطلوبة
+ALTER PUBLICATION supabase_realtime ADD TABLE public.messages;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.message_reads;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.friendships;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.calls;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.call_participants;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.profiles;
+
+-- إعداد Storage Buckets الخاصة بالصور الشخصية وملفات الدردشة (محمية وليست عامة)
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('avatars', 'avatars', true), ('chat-media', 'chat-media', false)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE POLICY "avatars_public_read" ON storage.objects
+  FOR SELECT USING (bucket_id = 'avatars');
+
+CREATE POLICY "avatars_user_upload" ON storage.objects
+  FOR INSERT TO authenticated
+  WITH CHECK (bucket_id = 'avatars' AND (storage.foldername(name))[1] = auth.uid()::text);
+
+CREATE POLICY "chat_media_member_read" ON storage.objects
+  FOR SELECT TO authenticated
+  USING (
+    bucket_id = 'chat-media'
+    AND is_conversation_member(((storage.foldername(name))[1])::uuid, auth.uid())
+  );
+
+CREATE POLICY "chat_media_member_upload" ON storage.objects
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    bucket_id = 'chat-media'
+    AND is_conversation_member(((storage.foldername(name))[1])::uuid, auth.uid())
+  );
+ثانيا: إعداد مشروع Expo / React Native (التطبيقات/الجوال)
+
+1. أوامر إنشاء المشروع وتثبيت المكتبات الحقيقية
+شغل هذه الأوامر في الطرفية (المحطة الطرفية) داخل مجلدالتطبيقات/الجوال:
+
+باش
+npx create-expo-app@latest mobile --template tabs
+cd mobile
+npx expo install expo-dev-client expo-router expo-crypto expo-secure-store expo-apple-authentication \
+  expo-notifications expo-device expo-image-picker expo-document-picker expo-av expo-location \
+  expo-localization @react-native-async-storage/async-storage @react-native-community/netinfo \
+  @react-native-google-signin/google-signin @supabase/supabase-js \
+  react-native-webrtc @config-plugins/react-native-webrtc react-native-incall-manager lucide-react-native
+2. ملف.env.مثال(أحفظ القيم الحقيقية في.envمحليا ولا ترفعه إلى جيت)
+بياق
+EXPO_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT_ID.supabase.co
+EXPO_PUBLIC_SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
+EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=YOUR_GOOGLE_WEB_CLIENT_ID.apps.googleusercontent.com
+EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID=YOUR_GOOGLE_IOS_CLIENT_ID.apps.googleusercontent.com
+EXPO_PUBLIC_APP_SCHEME=connectapp
+ملاحظة أمنية: لا تضعSUPABASE_SERVICE_ROLE_KEYأو مفاتيح TURN السرية أو مفاتيح FCM داخل.envبالتطبيق أبدا؛ مكانها الحصري هو أسرار وظائف حافة سوبابيس.1].
+3. ملفتطبيق.تكوينج.ts(يدعم WebRTC + Apple + Google + الإشعارات + RTL)1][2][3]
+تي اس
+import { ExpoConfig, ConfigContext } from 'expo/config';
+
+export default ({ config }: ConfigContext): ExpoConfig => ({
+  ...config,
+  name: 'Connect - كونكت',
+  slug: 'connect-app',
+  scheme: process.env.EXPO_PUBLIC_APP_SCHEME || 'connectapp',
+  version: '1.0.0',
+  orientation: 'portrait',
+  userInterfaceStyle: 'automatic',
+  supportsTablet: true,
+  ios: {
+    supportsTablet: true,
+    bundleIdentifier: 'com.connectapp.messenger',
+    usesAppleSignIn: true,
+    infoPlist: {
+      NSCameraUsageDescription: 'يحتاج كونكت إلى الكاميرا لإجراء مكالمات الفيديو والتقاط الصور.',
+      NSMicrophoneUsageDescription: 'يحتاج كونكت إلى الميكروفون للمكالمات الصوتية والمرئية والرسائل الصوتية.',
+      NSLocationWhenInUseUsageDescription: 'يحتاج كونكت إلى موقعك لمشاركته في المحادثات عند طلبك.',
+      UIBackgroundModes: ['audio', 'voip', 'remote-notification'],
+    },
+  },
+  android: {
+    package: 'com.connectapp.messenger',
+    permissions: [
+      'android.permission.CAMERA',
+      'android.permission.RECORD_AUDIO',
+      'android.permission.MODIFY_AUDIO_SETTINGS',
+      'android.permission.ACCESS_NETWORK_STATE',
+      'android.permission.INTERNET',
+      'android.permission.BLUETOOTH',
+      'android.permission.BLUETOOTH_CONNECT',
+      'android.permission.WAKE_LOCK',
+      'android.permission.ACCESS_FINE_LOCATION',
+    ],
+  },
+  web: {
+    bundler: 'metro',
+    output: 'single',
+  },
+  plugins: [
+    'expo-router',
+    'expo-apple-authentication',
+    '@config-plugins/react-native-webrtc',
+    [
+      '@react-native-google-signin/google-signin',
+      {
+        iosUrlScheme: process.env.EXPO_PUBLIC_GOOGLE_IOS_URL_SCHEME || 'com.googleusercontent.apps.YOUR_IOS_ID',
+      },
+    ],
+    [
+      'expo-notifications',
+      {
+        color: '#22C55E',
+      },
+    ],
+    [
+      'expo-localization',
+      {
+        supportedLocales: {
+          ios: ['ar', 'en'],
+          android: ['ar', 'en'],
+        },
+      },
+    ],
+  ],
+  extra: {
+    supportsRTL: true,
+  },
+});
+ثالثا: عميل Supabase ونظام المصادقة الحقيقي
+
+1.الخدمات/supabase.ts
+تي اس
+import 'react-native-url-polyfill/auto';
+import { AppState, Platform } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!;
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    storage: Platform.OS === 'web' ? undefined : AsyncStorage,
+    autoRefreshToken: true,
+    persistSession: true,
+    detectSessionInUrl: Platform.OS === 'web',
+  },
+});
+
+if (Platform.OS !== 'web') {
+  AppState.addEventListener('change', (state) => {
+    if (state === 'active') {
+      supabase.auth.startAutoRefresh();
+    } else {
+      supabase.auth.stopAutoRefresh();
+    }
+  });
+}
+2.الخدمات/المصادقة.ts(البريد، Google OAuth 2.0، تسجيل الدخول باستخدام Apple، استعادة كلمة المرور، حذف الحساب)3][4]
+تي اس
+import { Platform } from 'react-native';
+import * as AppleAuthentication from 'expo-apple-authentication';
+import * as Crypto from 'expo-crypto';
+import { GoogleSignin } from '@react-native-google-signin/google-signin';
+import { supabase } from './supabase';
+
+// تهيئة Google Sign-In للأجهزة المحمولة
+if (Platform.OS !== 'web') {
+  GoogleSignin.configure({
+    webClientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+    iosClientId: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+    offlineAccess: true,
+  });
+}
+
+export async function signUpWithEmail(params: {
+  email: string;
+  password: string;
+  fullName: string;
+  username: string;
+}) {
+  const { data, error } = await supabase.auth.signUp({
+    email: params.email.trim(),
+    password: params.password,
+    options: {
+      emailRedirectTo: `${process.env.EXPO_PUBLIC_APP_SCHEME || 'connectapp'}://auth/callback`,
+      data: {
+        full_name: params.fullName.trim(),
+        username: params.username.trim().toLowerCase(),
+      },
+    },
+  });
+  if (error) throw error;
+  return data;
+}
+
+export async function signInWithEmail(email: string, password: string) {
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: email.trim(),
+    password,
+  });
+  if (error) throw error;
+  return data;
+}
+
+export async function resetPassword(email: string) {
+  const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+    redirectTo: `${process.env.EXPO_PUBLIC_APP_SCHEME || 'connectapp'}://auth/reset-password`,
+  });
+  if (error) throw error;
+}
+
+export async function signInWithGoogle() {
+  if (Platform.OS === 'web') {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: window.location.origin },
+    });
+    if (error) throw error;
+    return data;
+  }
+
+  await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+  const userInfo = await GoogleSignin.signIn();
+  const idToken = userInfo.data?.idToken;
+  if (!idToken) throw new Error('لم يتم استلام رمز الهوية من Google.');
+
+  const { data, error } = await supabase.auth.signInWithIdToken({
+    provider: 'google',
+    token: idToken,
+  });
+  if (error) throw error;
+  return data;
+}
+
+export async function signInWithApple() {
+  if (Platform.OS === 'web') {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'apple',
+      options: { redirectTo: window.location.origin },
+    });
+    if (error) throw error;
+    return data;
+  }
+
+  const rawNonce = Crypto.randomUUID();
+  const hashedNonce = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    rawNonce
+  );
+
+  const credential = await AppleAuthentication.signInAsync({
+    requestedScopes: [
+      AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+      AppleAuthentication.AppleAuthenticationScope.EMAIL,
+    ],
+    nonce: hashedNonce,
+  });
+
+  if (!credential.identityToken) {
+    throw new Error('لم يتم استلام رمز الهوية من Apple.');
+  }
+
+  const { data, error } = await supabase.auth.signInWithIdToken({
+    provider: 'apple',
+    token: credential.identityToken,
+    nonce: rawNonce,
+  });
+  if (error) throw error;
+
+  // Apple يرسل الاسم في أول تسجيل فقط؛ نحفظه مباشرة في جدول profiles
+  if (credential.fullName?.givenName && data.user) {
+    const fullName = [credential.fullName.givenName, credential.fullName.familyName]
+      .filter(Boolean)
+      .join(' ');
+    await supabase.from('profiles').update({ full_name: fullName }).eq('id', data.user.id);
+  }
+
+  return data;
+}
+
+export async function deleteAccountPermanently() {
+  const { error } = await supabase.functions.invoke('delete-account');
+  if (error) throw error;
+  await supabase.auth.signOut();
+}
+رابعا: محرك المكالمات الصوتية والرئية الحقيقي (WebRTC + الإشارة + TURN)
+
+1.الخدمات/webrtc.ts
+يدعم المكالمات الفردية والجماعية (شبكة متعددة الأقران)، كتم الميكروفون، إيقاف الكاميرا، تبديل الكاميرا، مكبر الصوت، إعادة الاتصال تلقائيا عند تبديل الشبكة (إعادة تشغيل ICE):
+
+تي اس
+import { Platform } from 'react-native';
+import {
+  RTCPeerConnection,
+  RTCSessionDescription,
+  RTCIceCandidate,
+  mediaDevices,
+  MediaStream,
+} from 'react-native-webrtc';
+import InCallManager from 'react-native-incall-manager';
+import { supabase } from './supabase';
+
+export type CallType = 'audio' | 'video';
+
+interface SignalPayload {
+  type: 'offer' | 'answer' | 'ice-candidate' | 'hangup' | 'media-state';
+  from: string;
+  to?: string;
+  sdp?: any;
+  candidate?: any;
+  audioEnabled?: boolean;
+  videoEnabled?: boolean;
+}
+
+export class WebRTCManager {
+  private peers = new Map<string, RTCPeerConnection>();
+  private localStream: MediaStream | null = null;
+  private remoteStreams = new Map<string, MediaStream>();
+  private channel: ReturnType<typeof supabase.channel> | null = null;
+  private iceServers: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+  constructor(
+    private callId: string,
+    private currentUserId: string,
+    private callType: CallType,
+    private onRemoteStreamsChange: (streams: Map<string, MediaStream>) => void,
+    private onPeerEnded: (peerId: string) => void
+  ) {}
+
+  async init(): Promise<MediaStream> {
+    // 1. جلب بيانات خادم TURN من Supabase Edge Function بشكل آمن
+    try {
+      const { data } = await supabase.functions.invoke('get-turn-credentials');
+      if (data?.iceServers) {
+        this.iceServers = data.iceServers;
+      }
+    } catch {
+      // الاحتفاظ بـ STUN الاحتياطي إذا تعذر الوصول مؤقتاً
+    }
+
+    // 2. تشغيل الصوت والمايك عبر InCallManager
+    if (Platform.OS !== 'web') {
+      InCallManager.start({ media: this.callType === 'video' ? 'video' : 'audio' });
+      InCallManager.setForceSpeakerphoneOn(this.callType === 'video');
+    }
+
+    // 3. الحصول على بث الكاميرا والميكروفون المحلي
+    const stream = await mediaDevices.getUserMedia({
+      audio: true,
+      video:
+        this.callType === 'video'
+          ? { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }
+          : false,
+    });
+    this.localStream = stream as MediaStream;
+
+    // 4. الاشتراك بقناة Signaling الفورية الخاصة بالمكالمة
+    this.channel = supabase
+      .channel(`call:${this.callId}`)
+      .on('broadcast', { event: 'signal' }, async ({ payload }: { payload: SignalPayload }) => {
+        if (payload.from === this.currentUserId) return;
+        if (payload.to && payload.to !== this.currentUserId) return;
+
+        switch (payload.type) {
+          case 'offer':
+            await this.handleOffer(payload.from, payload.sdp);
+            break;
+          case 'answer':
+            await this.handleAnswer(payload.from, payload.sdp);
+            break;
+          case 'ice-candidate':
+            await this.handleIceCandidate(payload.from, payload.candidate);
+            break;
+          case 'hangup':
+            this.removePeer(payload.from);
+            this.onPeerEnded(payload.from);
+            break;
+        }
+      })
+      .subscribe();
+
+    return this.localStream;
+  }
+
+  private createPeerConnection(peerId: string): RTCPeerConnection {
+    const existing = this.peers.get(peerId);
+    if (existing) return existing;
+
+    const pc = new RTCPeerConnection({
+      iceServers: this.iceServers,
+      iceTransportPolicy: 'all',
+    });
+
+    this.localStream?.getTracks().forEach((track) => {
+      pc.addTrack(track, this.localStream!);
+    });
+
+    (pc as any).ontrack = (event: any) => {
+      const [remoteStream] = event.streams;
+      if (remoteStream) {
+        this.remoteStreams.set(peerId, remoteStream);
+        this.onRemoteStreamsChange(new Map(this.remoteStreams));
+      }
+    };
+
+    (pc as any).onicecandidate = (event: any) => {
+      if (event.candidate) {
+        this.sendSignal({
+          type: 'ice-candidate',
+          from: this.currentUserId,
+          to: peerId,
+          candidate: event.candidate,
+        });
+      }
+    };
+
+    // معالجة انقطاع الاتصال وإعادة المحاولة تلقائياً (ICE Restart)
+    (pc as any).oniceconnectionstatechange = async () => {
+      const state = pc.iceConnectionState;
+      if (state === 'failed' || state === 'disconnected') {
+        try {
+          const offer = await pc.createOffer({ iceRestart: true });
+          await pc.setLocalDescription(offer);
+          this.sendSignal({
+            type: 'offer',
+            from: this.currentUserId,
+            to: peerId,
+            sdp: offer,
+          });
+        } catch {
+          // تجاهل إذا تم إغلاق الاتصال بالفعل
+        }
+      }
+    };
+
+    this.peers.set(peerId, pc);
+    return pc;
+  }
+
+  async callPeer(peerId: string) {
+    const pc = this.createPeerConnection(peerId);
+    const offer = await pc.createOffer({});
+    await pc.setLocalDescription(offer);
+    await this.sendSignal({
+      type: 'offer',
+      from: this.currentUserId,
+      to: peerId,
+      sdp: offer,
+    });
+  }
+
+  private async handleOffer(peerId: string, sdp: any) {
+    const pc = this.createPeerConnection(peerId);
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await this.sendSignal({
+      type: 'answer',
+      from: this.currentUserId,
+      to: peerId,
+      sdp: answer,
+    });
+  }
+
+  private async handleAnswer(peerId: string, sdp: any) {
+    const pc = this.peers.get(peerId);
+    if (!pc) return;
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+  }
+
+  private async handleIceCandidate(peerId: string, candidate: any) {
+    const pc = this.peers.get(peerId);
+    if (!pc || !candidate) return;
+    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+  }
+
+  toggleMute(muted: boolean) {
+    this.localStream?.getAudioTracks().forEach((track) => {
+      track.enabled = !muted;
+    });
+  }
+
+  toggleCamera(enabled: boolean) {
+    this.localStream?.getVideoTracks().forEach((track) => {
+      track.enabled = enabled;
+    });
+  }
+
+  switchCamera() {
+    this.localStream?.getVideoTracks().forEach((track: any) => {
+      if (typeof track._switchCamera === 'function') {
+        track._switchCamera();
+      }
+    });
+  }
+
+  setSpeakerphone(enabled: boolean) {
+    if (Platform.OS !== 'web') {
+      InCallManager.setForceSpeakerphoneOn(enabled);
+    }
+  }
+
+  private async sendSignal(payload: SignalPayload) {
+    await this.channel?.send({
+      type: 'broadcast',
+      event: 'signal',
+      payload,
+    });
+  }
+
+  private removePeer(peerId: string) {
+    this.peers.get(peerId)?.close();
+    this.peers.delete(peerId);
+    this.remoteStreams.delete(peerId);
+    this.onRemoteStreamsChange(new Map(this.remoteStreams));
+  }
+
+  async cleanup() {
+    await this.sendSignal({ type: 'hangup', from: this.currentUserId });
+    this.peers.forEach((pc) => pc.close());
+    this.peers.clear();
+    this.remoteStreams.clear();
+    this.localStream?.getTracks().forEach((t) => t.stop());
+    this.localStream = null;
+    if (Platform.OS !== 'web') {
+      InCallManager.stop();
+    }
+    if (this.channel) {
+      await supabase.removeChannel(this.channel);
+      this.channel = null;
+    }
+  }
+}
+خامسا: ال Backend السحابي (Supabase Edge Functions + خادم TURN)
+
+1.supabase/functions/get-turn-credentials/index.ts
+يرجع بيانات اتصال STUN/TURN ديناميكيا دون كشف المفاتيح في التطبيق (يدعم Metered أو Coturn الثابت عبر Secrets):
+
+تي اس
+import { serve } from 'https://deno.land/std@0.208.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+serve(async (req) => {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return new Response('Unauthorized', { status: 401 });
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+    { global: { headers: { Authorization: authHeader } } }
+  );
+
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return new Response('Unauthorized', { status: 401 });
+
+  const meteredKey = Deno.env.get('METERED_API_KEY');
+  const meteredDomain = Deno.env.get('METERED_DOMAIN');
+
+  if (meteredKey && meteredDomain) {
+    const res = await fetch(
+      `https://${meteredDomain}/api/v1/turn/credentials?apiKey=${meteredKey}`
+    );
+    const iceServers = await res.json();
+    return new Response(JSON.stringify({ iceServers }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // أو استخدام خادم Coturn الخاص بك عبر Secrets
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    {
+      urls: Deno.env.get('COTURN_URL')!,
+      username: Deno.env.get('COTURN_USERNAME')!,
+      credential: Deno.env.get('COTURN_PASSWORD')!,
+    },
+  ];
+
+  return new Response(JSON.stringify({ iceServers }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+});
+2.supabase/functions/delete-account/index.ts
+لحذف المستخدم نهائيا منمصادقة.المستخدمين(وهو يحذف ملفه وبياناته المرتبطة عبرعلى حذف التتالي):
+
+تي اس
+import { serve } from 'https://deno.land/std@0.208.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+serve(async (req) => {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return new Response('Unauthorized', { status: 401 });
+
+  const userClient = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+    { global: { headers: { Authorization: authHeader } } }
+  );
+  const { data: { user } } = await userClient.auth.getUser();
+  if (!user) return new Response('Unauthorized', { status: 401 });
+
+  const adminClient = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+  const { error } = await adminClient.auth.admin.deleteUser(user.id);
+  if (error) return new Response(JSON.stringify({ error: error.message }), { status: 400 });
+
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+});
+3.supabase/functions/send-push/index.ts(إشعارات المكالمات والرسائل والأسال الصداقة)
+تي اس
+import { serve } from 'https://deno.land/std@0.208.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+serve(async (req) => {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return new Response('Unauthorized', { status: 401 });
+
+  const { recipientId, title, body, data } = await req.json();
+  const adminClient = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+
+  const { data: profile } = await adminClient
+    .from('profiles')
+    .select('fcm_token')
+    .eq('id', recipientId)
+    .single();
+
+  if (!profile?.fcm_token) {
+    return new Response(JSON.stringify({ sent: false, reason: 'No push token' }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const pushRes = await fetch('https://exp.host/--/api/v2/push/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      to: profile.fcm_token,
+      sound: data?.type === 'incoming_call' ? 'default' : 'default',
+      priority: 'high',
+      title,
+      body,
+      data,
+    }),
+  });
+
+  const result = await pushRes.json();
+  return new Response(JSON.stringify({ sent: true, result }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+});
+4.خادم الدوران/docker-compose.yml(خادم كوتور مستقل على VPS)
+يامل
+services:
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    restart: always
+    command:
+      - -n
+      - --log-file=stdout
+      - --realm=${TURN_DOMAIN}
+      - --user=${TURN_USER}:${TURN_PASSWORD}
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --min-port=49152
+      - --max-port=65535
+      - --fingerprint
+      - 
