@@ -335,6 +335,8 @@ app.get('/api/auth/session', async (req, res) => {
 app.get('/api/auth/providers', (_req, res) => {
   res.json({
     googleEnabled: true,
+    googleClientId:
+      (process.env.GOOGLE_OAUTH_CLIENT_ID || '').split(',')[0].trim() || null,
     appleWebEnabled: Boolean(process.env.APPLE_SERVICE_ID?.trim()),
     appleNativeSupported: true,
     smtpConfigured: isSmtpConfigured(),

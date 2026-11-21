@@ -6,6 +6,7 @@ import {
   signInWithRedirect,
   signOut,
 } from 'firebase/auth';
+import { GoogleSignInButton } from './GoogleSignInButton';
 import {
   AlertCircle,
   CheckCircle2,
@@ -107,6 +108,28 @@ export function AuthScreen({
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [oauthBusy, setOauthBusy] = useState<'google' | 'apple' | null>(null);
+
+  const [googleClientId, setGoogleClientId] = useState<string | null>(null);
+  useEffect(() => {
+    api
+      .getAuthProviders()
+      .then((p) => setGoogleClientId(p.googleClientId || null))
+      .catch(() => {});
+  }, []);
+
+  async function handleGoogleCredential(idToken: string) {
+    setError(null);
+    setNotice(null);
+    setOauthBusy('google');
+    try {
+      const res = await api.loginWithGoogle({ idToken });
+      await onAuthenticated(res.token, res.user, res.settings);
+    } catch (err) {
+      setError(mapServerError(err));
+    } finally {
+      setOauthBusy(null);
+    }
+  }
 
   const [otpExpirySeconds, setOtpExpirySeconds] = useState(0);
   const [resendCooldownSeconds, setResendCooldownSeconds] = useState(0);
@@ -557,21 +580,31 @@ export function AuthScreen({
           {/* OAuth Provider Buttons */}
           {showSocialButtons && (
             <div className="space-y-3 mb-6">
-              <button
-                type="button"
-                onClick={handleGoogleLogin}
-                disabled={loading || oauthBusy !== null}
-                className="w-full min-h-[46px] px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-60 text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center justify-center gap-3 transition-colors whitespace-nowrap"
-              >
-                <GoogleMark />
-                <span>
-                  {oauthBusy === 'google'
-                    ? lang === 'ar'
-                      ? 'جاري التحقق عبر Google...'
-                      : 'Verifying Google account...'
-                    : dict.continueWithGoogle}
-                </span>
-              </button>
+              {googleClientId ? (
+                <GoogleSignInButton
+                  clientId={googleClientId}
+                  lang={lang}
+                  disabled={loading || oauthBusy !== null}
+                  onCredential={handleGoogleCredential}
+                  onError={setError}
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleGoogleLogin}
+                  disabled={loading || oauthBusy !== null}
+                  className="w-full min-h-[46px] px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-60 text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center justify-center gap-3 transition-colors whitespace-nowrap"
+                >
+                  <GoogleMark />
+                  <span>
+                    {oauthBusy === 'google'
+                      ? lang === 'ar'
+                        ? 'جاري التحقق عبر Google...'
+                        : 'Verifying Google account...'
+                      : dict.continueWithGoogle}
+                  </span>
+                </button>
+              )}
 
               <button
                 type="button"
