@@ -445,7 +445,8 @@ export function getMessageReadStatus(
  */
 export function mapFirebaseAuthErrorCode(
   code: string | undefined,
-  lang: Language
+  lang: Language,
+  host?: string
 ): string | null {
   if (!code) return null;
   switch (code) {
@@ -460,8 +461,8 @@ export function mapFirebaseAuthErrorCode(
         : 'Your browser blocked the Google sign-in popup. Please allow popups and try again.';
     case 'auth/unauthorized-domain':
       return lang === 'ar'
-        ? 'هذا النطاق غير مصرح به لتسجيل الدخول عبر Google. يرجى فتح التطبيق من الرابط المعتمد.'
-        : 'This domain is not authorized for Google Sign-In. Please open the app from its approved preview URL.';
+        ? `هذا النطاق${host ? ` (${host})` : ''} غير مضاف إلى النطاقات المصرّح بها لتسجيل الدخول عبر Google. يمكنك الدخول بالبريد الإلكتروني الآن، ويجب على مالك التطبيق إضافة النطاق في Firebase Authentication ثم Authorized domains.`
+        : `This domain${host ? ` (${host})` : ''} is not in the Google Sign-In authorized domains. You can still sign in with email; the app owner must add it under Firebase Authentication, Authorized domains.`;
     case 'auth/operation-not-allowed':
       return lang === 'ar'
         ? 'تسجيل الدخول عبر Google غير مفعّل في إعدادات المصادقة الحالية.'

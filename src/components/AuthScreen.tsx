@@ -281,7 +281,7 @@ export function AuthScreen({
 
     if (err && typeof err === 'object' && 'code' in err) {
       const fbCode = String((err as { code?: unknown }).code || '');
-      const mapped = mapFirebaseAuthErrorCode(fbCode, lang);
+      const mapped = mapFirebaseAuthErrorCode(fbCode, lang, window.location.hostname);
       if (mapped) return mapped;
     }
 
