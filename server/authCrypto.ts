@@ -131,6 +131,13 @@ export class InvalidOAuthTokenError extends Error {
   }
 }
 
+export class AppleNotConfiguredError extends Error {
+  constructor(message = 'Apple Sign-In is not configured on the server yet.') {
+    super(message);
+    this.name = 'AppleNotConfiguredError';
+  }
+}
+
 /**
  * Parses comma-separated OAuth client IDs cleanly from configuration values.
  */
@@ -279,9 +286,7 @@ export async function verifyAppleIdentityToken(input: {
   ].filter((v): v is string => Boolean(v && v.trim()));
 
   if (allowedAudiences.length === 0) {
-    throw new Error(
-      'Apple Sign-In is not configured on the server yet.'
-    );
+    throw new AppleNotConfiguredError();
   }
 
   let payload;
