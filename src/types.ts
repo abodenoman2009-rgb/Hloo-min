@@ -32,6 +32,7 @@ export interface AuthSessionPayload {
 
 export interface AuthProvidersInfo {
   googleEnabled: boolean;
+  googleClientId?: string | null;
   appleWebEnabled: boolean;
   appleNativeSupported: boolean;
   smtpConfigured: boolean;
